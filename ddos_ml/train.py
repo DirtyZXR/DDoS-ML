@@ -10,13 +10,18 @@ from sklearn.model_selection import train_test_split
 from sklearn.metrics import classification_report, accuracy_score, confusion_matrix
 import seaborn as sns
 
+from ddos_ml.features import (
+    DATASET_DIR, PCA_N_COMPONENTS,
+    MODEL_PATH, PCA_PATH, SCALER_PATH, LABEL_ENCODER_PATH,
+)
+
 def load_dataset():
     ddos_set = pd.DataFrame()
     ddos_set = pd.concat([
         ddos_set,
-        pd.read_parquet('dataset/Syn-training.parquet'),
-        pd.read_parquet('dataset/UDP-training.parquet'),
-        pd.read_parquet('dataset/DNS-testing.parquet')
+        pd.read_parquet(DATASET_DIR / 'Syn-training.parquet'),
+        pd.read_parquet(DATASET_DIR / 'UDP-training.parquet'),
+        pd.read_parquet(DATASET_DIR / 'DNS-testing.parquet')
     ])
     ddos_set = ddos_set[ddos_set['Label'] != 'MSSQL']
     ddos_set = ddos_set.drop_duplicates()
@@ -89,7 +94,7 @@ def work_PCA(data: pd.DataFrame, label_col='Label'):
     plt.grid(True)
     plt.show()
 
-    n_components = 20
+    n_components = PCA_N_COMPONENTS
     pca = PCA(n_components=n_components)
     principal_components = pca.fit_transform(X_scaled)
 
@@ -103,8 +108,8 @@ def work_PCA(data: pd.DataFrame, label_col='Label'):
     return pca, X_scaled, y, scaler  # Возвращаем scaler
 
 def train_and_save_models(data: pd.DataFrame, scaler, pca, label_col='Label',
-                          model_path='xgb_model.pkl', pca_path='pca_model.pkl',
-                          scaler_path='scaler.pkl', le_path='label_encoder.pkl'):
+                          model_path=MODEL_PATH, pca_path=PCA_PATH,
+                          scaler_path=SCALER_PATH, le_path=LABEL_ENCODER_PATH):
     X = data.drop(columns=[label_col])
     y = data[label_col]
 
@@ -149,7 +154,7 @@ if __name__ == '__main__':
     data = preprocess_dataset(data)
     data = detect_and_remove_outliers(data)
     pca, X_scaled, y, scaler = work_PCA(data, label_col='Label')
-    n_components = 20
+    n_components = PCA_N_COMPONENTS
     principal_components = pca.transform(X_scaled)
     df_pca = pd.DataFrame(principal_components, columns=[f'PC{i}' for i in range(1, n_components + 1)])
     df_pca['Label'] = y.reset_index(drop=True)
