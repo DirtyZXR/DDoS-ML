@@ -1,19 +1,30 @@
-import joblib
-import pandas as pd
+"""Обучение детектора DDoS: загрузка датасета, отсев выбросов, PCA и XGBoost.
+
+Конвейер построен так, чтобы оценка была честной (без утечки данных):
+сначала отделяется тестовая выборка, и только потом на обучающей части
+учатся отсев выбросов, стандартизация и PCA. Тест участвует лишь на этапе
+`transform`/`predict`. После честной оценки финальные артефакты (scaler, PCA,
+модель) переобучаются на всех данных и сохраняются для онлайн-детекции.
+"""
+
+from collections import namedtuple
+
 import numpy as np
-from sklearn.ensemble import IsolationForest
-import matplotlib.pyplot as plt
+import pandas as pd
 from sklearn.decomposition import PCA
-from sklearn.preprocessing import StandardScaler, LabelEncoder
-import xgboost as xgb
+from sklearn.ensemble import IsolationForest
+from sklearn.metrics import accuracy_score, classification_report, confusion_matrix
 from sklearn.model_selection import train_test_split
-from sklearn.metrics import classification_report, accuracy_score, confusion_matrix
-import seaborn as sns
+from sklearn.preprocessing import LabelEncoder, StandardScaler
 
 from ddos_ml.features import (
-    DATASET_DIR, PCA_N_COMPONENTS,
-    MODEL_PATH, PCA_PATH, SCALER_PATH, LABEL_ENCODER_PATH,
+    DATASET_DIR, LABEL_ENCODER_PATH, MODEL_PATH, PCA_N_COMPONENTS, PCA_PATH, SCALER_PATH,
 )
+
+# Признаки и метки честной оценки: train уже очищен от выбросов и преобразован,
+# test преобразован тем же scaler/PCA, но в их обучении не участвовал.
+EvalSplit = namedtuple("EvalSplit", ["X_train", "y_train", "X_test", "y_test", "scaler", "pca"])
+
 
 def load_dataset():
     ddos_set = pd.DataFrame()
@@ -28,6 +39,7 @@ def load_dataset():
     ddos_set = ddos_set.dropna()
     print(ddos_set['Label'].value_counts())
     return ddos_set
+
 
 def preprocess_dataset(dataset, low_unique_threshold=1, one_hot_threshold=3):
     cols_to_drop = []
@@ -55,72 +67,60 @@ def preprocess_dataset(dataset, low_unique_threshold=1, one_hot_threshold=3):
     print(balanced_dataset['Label'].value_counts())
     return balanced_dataset
 
-def detect_and_remove_outliers(data: pd.DataFrame, features: list = None, contamination: float = 0.05, random_state: int = 42):
-    if features is None:
-        features = data.select_dtypes(include=['number']).columns.tolist()
 
+def outlier_mask(X: pd.DataFrame, contamination: float = 0.05, random_state: int = 42) -> np.ndarray:
+    """Булева маска инлайеров по числовым признакам (IsolationForest).
+
+    Важно: лес обучается ровно на переданных строках. Чтобы оценка была честной,
+    при подготовке теста сюда передают только обучающую часть.
+    """
+    features = X.select_dtypes(include=['number']).columns.tolist()
     iso_forest = IsolationForest(
         n_estimators=1000, max_samples='auto', contamination=contamination,
         max_features=1.0, bootstrap=False, n_jobs=-1, random_state=random_state, verbose=0
     )
-    X = data[features]
-    outlier_pred = iso_forest.fit_predict(X)
-    mask = outlier_pred == 1
-    cleaned_data = data.loc[mask].reset_index(drop=True)
+    return iso_forest.fit_predict(X[features]) == 1
 
-    print(f"Размер данных до удаления выбросов: {data.shape}")
-    print(f"Размер данных после удаления выбросов: {cleaned_data.shape}")
-    print(f"Удалено выбросов: {data.shape[0] - cleaned_data.shape[0]}")
-    print(cleaned_data['Label'].value_counts())
-    return cleaned_data
 
-def work_PCA(data: pd.DataFrame, label_col='Label'):
-    data = data.reset_index(drop=True)
-    X = data.drop(columns=[label_col])
-    y = data[label_col]
+def fit_preprocessors(X_train: pd.DataFrame):
+    """Учит StandardScaler и PCA ТОЛЬКО на обучающих данных."""
+    scaler = StandardScaler().fit(X_train)
+    pca = PCA(n_components=PCA_N_COMPONENTS).fit(scaler.transform(X_train))
+    return scaler, pca
 
-    scaler = StandardScaler()
-    print("Признаки перед scaler.fit_transform:", X.columns.tolist())
-    X_scaled = scaler.fit_transform(X)
 
-    pca_full = PCA()
-    pca_full.fit(X_scaled)
-    cumulative_variance = np.cumsum(pca_full.explained_variance_ratio_)
-    plt.figure(figsize=(8,5))
-    plt.plot(cumulative_variance, marker='o', linestyle='--', color='b')
-    plt.xlabel('Количество главных компонент')
-    plt.ylabel('Накопленная объяснённая дисперсия')
-    plt.title('Зависимость объяснённой дисперсии от числа компонент PCA')
-    plt.grid(True)
-    plt.show()
+def apply_preprocessors(scaler, pca, X) -> np.ndarray:
+    """Применяет уже обученные scaler и PCA (только transform, без fit)."""
+    return pca.transform(scaler.transform(X))
 
-    n_components = PCA_N_COMPONENTS
-    pca = PCA(n_components=n_components)
-    principal_components = pca.fit_transform(X_scaled)
 
-    df_pca = pd.DataFrame(
-        data=principal_components,
-        columns=[f'PC{i}' for i in range(1, n_components + 1)]
-    )
-    df_pca = pd.concat([df_pca, y.reset_index(drop=True)], axis=1)
-    print(df_pca.head())
+def prepare_eval_split(X: pd.DataFrame, y_encoded: np.ndarray,
+                       test_size: float = 0.2, random_state: int = 42) -> EvalSplit:
+    """Готовит честную оценку: split → fit на train → transform обеих частей.
 
-    return pca, X_scaled, y, scaler  # Возвращаем scaler
-
-def train_and_save_models(data: pd.DataFrame, scaler, pca, label_col='Label',
-                          model_path=MODEL_PATH, pca_path=PCA_PATH,
-                          scaler_path=SCALER_PATH, le_path=LABEL_ENCODER_PATH):
-    X = data.drop(columns=[label_col])
-    y = data[label_col]
-
-    le = LabelEncoder()
-    y_encoded = le.fit_transform(y)
-
+    Тестовая выборка отделяется ПЕРВОЙ. Отсев выбросов, scaler и PCA учатся
+    только на train; тест они лишь преобразуют. Так метрика не завышается.
+    """
     X_train, X_test, y_train, y_test = train_test_split(
-        X, y_encoded, test_size=0.2, random_state=42, stratify=y_encoded
+        X, y_encoded, test_size=test_size, random_state=random_state, stratify=y_encoded
     )
 
-    model = xgb.XGBClassifier(
+    mask = outlier_mask(X_train, random_state=random_state)
+    X_train, y_train = X_train[mask], y_train[mask]
+
+    scaler, pca = fit_preprocessors(X_train)
+    return EvalSplit(
+        X_train=apply_preprocessors(scaler, pca, X_train), y_train=y_train,
+        X_test=apply_preprocessors(scaler, pca, X_test), y_test=y_test,
+        scaler=scaler, pca=pca,
+    )
+
+
+def build_model():
+    """Конфигурация XGBoost-классификатора (общая для оценки и финального обучения)."""
+    import xgboost as xgb
+
+    return xgb.XGBClassifier(
         n_estimators=200, max_depth=7, learning_rate=0.1, min_child_weight=3,
         gamma=0.2, subsample=0.8, colsample_bytree=0.8, reg_alpha=0.1,
         reg_lambda=1.0, scale_pos_weight=1, tree_method='hist',
@@ -128,12 +128,17 @@ def train_and_save_models(data: pd.DataFrame, scaler, pca, label_col='Label',
         objective='multi:softmax', eval_metric='mlogloss', random_state=42,
         n_jobs=-1, verbosity=1
     )
-    model.fit(X_train, y_train)
 
+
+def evaluate(model, X_test: np.ndarray, y_test: np.ndarray, le: LabelEncoder) -> None:
+    """Печатает честные метрики на отложенном тесте и рисует матрицу ошибок."""
     y_pred = model.predict(X_test)
     print("Точность ~ ", accuracy_score(y_test, y_pred))
     print("\nОтчёт классификации:")
     print(classification_report(y_test, y_pred, target_names=le.classes_))
+
+    import matplotlib.pyplot as plt
+    import seaborn as sns
 
     cm = confusion_matrix(y_test, y_pred)
     plt.figure(figsize=(8, 6))
@@ -143,19 +148,46 @@ def train_and_save_models(data: pd.DataFrame, scaler, pca, label_col='Label',
     plt.title('Матрица ошибок')
     plt.show()
 
-    joblib.dump(model, model_path)
-    joblib.dump(pca, pca_path)
-    joblib.dump(scaler, scaler_path)
-    joblib.dump(le, le_path)
-    print(f"Модель, PCA, стандартизатор и энкодер меток сохранены в файлы:\n{model_path}\n{pca_path}\n{scaler_path}\n{le_path}")
 
-if __name__ == '__main__':
+def save_artifacts(model, pca, scaler, le: LabelEncoder) -> None:
+    import joblib
+
+    joblib.dump(model, MODEL_PATH)
+    joblib.dump(pca, PCA_PATH)
+    joblib.dump(scaler, SCALER_PATH)
+    joblib.dump(le, LABEL_ENCODER_PATH)
+    print("Модель, PCA, стандартизатор и энкодер меток сохранены в файлы:\n"
+          f"{MODEL_PATH}\n{PCA_PATH}\n{SCALER_PATH}\n{LABEL_ENCODER_PATH}")
+
+
+def main():
     data = load_dataset()
     data = preprocess_dataset(data)
-    data = detect_and_remove_outliers(data)
-    pca, X_scaled, y, scaler = work_PCA(data, label_col='Label')
-    n_components = PCA_N_COMPONENTS
-    principal_components = pca.transform(X_scaled)
-    df_pca = pd.DataFrame(principal_components, columns=[f'PC{i}' for i in range(1, n_components + 1)])
-    df_pca['Label'] = y.reset_index(drop=True)
-    train_and_save_models(df_pca, scaler, pca, label_col='Label')
+
+    X = data.drop(columns=['Label'])
+    y = data['Label']
+
+    # Кодировка меток — это просто отображение имён классов в числа, утечки нет.
+    le = LabelEncoder()
+    y_encoded = le.fit_transform(y)
+
+    # --- Честная оценка на отложенном тесте ---
+    split = prepare_eval_split(X, y_encoded)
+    eval_model = build_model()
+    eval_model.fit(split.X_train, split.y_train)
+    print("=== Честная оценка на отложенном тесте (артефакты этой модели не сохраняются) ===")
+    evaluate(eval_model, split.X_test, split.y_test, le)
+
+    # --- Финальные артефакты: переобучение на всех данных ---
+    # Выбросы убираем со всего набора — честной оценки это уже не касается.
+    mask = outlier_mask(X)
+    X_full, y_full = X[mask], y_encoded[mask]
+    final_scaler, final_pca = fit_preprocessors(X_full)
+    final_model = build_model()
+    final_model.fit(apply_preprocessors(final_scaler, final_pca, X_full), y_full)
+
+    save_artifacts(final_model, final_pca, final_scaler, le)
+
+
+if __name__ == '__main__':
+    main()
